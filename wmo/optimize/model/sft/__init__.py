@@ -1,5 +1,12 @@
 """Frozen, leakage-safe SFT datasets and managed offline Tinker SFT behavior."""
 
+from wmo.optimize.model.sft.anycloud import (
+    AnyCloudArtifactUpload,
+    AnyCloudSFTDatum,
+    AnyCloudTrainerArtifactStore,
+    AnyCloudTrainerBackend,
+    AnyCloudTrainerSession,
+)
 from wmo.optimize.model.sft.automatic import (
     AutomaticSFTPreparation,
     AutomaticSFTPreparationError,
@@ -81,6 +88,11 @@ from wmo.optimize.model.sft.training import (
 
 __all__ = [
     "AssistantActionEvent",
+    "AnyCloudArtifactUpload",
+    "AnyCloudSFTDatum",
+    "AnyCloudTrainerArtifactStore",
+    "AnyCloudTrainerBackend",
+    "AnyCloudTrainerSession",
     "AutomaticSFTPreparation",
     "AutomaticSFTPreparationError",
     "InitialSFTModelOptimizationSettings",
