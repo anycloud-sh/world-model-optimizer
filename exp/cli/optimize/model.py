@@ -6,11 +6,20 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Never
+from urllib.parse import urlsplit
 
 import typer
 from rich.console import Console
 from rich.prompt import Confirm, FloatPrompt, Prompt
 
+from exp.cli.optimize.anycloud import (
+    AnyCloudRun,
+    Trainer,
+    compose_anycloud_backend,
+    connection_provider,
+    frozen_connection,
+    resolve_anycloud_run,
+)
 from exp.cli.shared.consent import can_prompt, require_spend_consent
 from exp.cli.shared.options import ROOT_OPTION, usage_error
 from exp.cli.shared.theme import EXP_THEME
@@ -59,12 +68,20 @@ _DEFAULT_EPOCHS = 1
 _DEFAULT_CHECKPOINT_EVERY_STEPS = 10
 _DEFAULT_MAXIMUM_DATUM_TOKENS = 4096
 _DEFAULT_MAXIMUM_COST_USD = 25.0
+_DEFAULT_ANYCLOUD_MAXIMUM_STEP_SECONDS = 600.0
 _USAGE_ERRORS = (
     ModelCatalogError,
     ModelCredentialError,
     SFTModelOptimizationError,
     TinkerSFTDependencyError,
     ValueError,
+)
+
+
+_TRAINER_OPTION = typer.Option(
+    None,
+    "--trainer",
+    help="Managed trainer for the first run: tinker (default) or anycloud.",
 )
 
 
@@ -113,6 +130,44 @@ def optimize_model(
         "--non-interactive",
         help="Require complete flags and never ask setup or cost questions.",
     ),
+    trainer: Trainer | None = _TRAINER_OPTION,
+    anycloud_connection: str | None = typer.Option(
+        None,
+        "--anycloud-connection",
+        help="Existing or new local name for the AnyCloud trainer connection.",
+    ),
+    anycloud_url: str | None = typer.Option(
+        None,
+        "--anycloud-url",
+        help="HTTPS URL of the AnyCloud trainer service, required for a new connection.",
+    ),
+    anycloud_token_env: str | None = typer.Option(
+        None,
+        "--anycloud-token-env",
+        help="Environment-variable name containing the trainer token. Never persisted.",
+    ),
+    anycloud_artifact_prefix: str | None = typer.Option(
+        None,
+        "--anycloud-artifact-prefix",
+        help="Private s3://bucket/prefix for AnyCloud checkpoints and the trained adapter.",
+    ),
+    anycloud_artifact_region: str | None = typer.Option(
+        None,
+        "--anycloud-artifact-region",
+        help="AWS region of the AnyCloud artifact bucket.",
+    ),
+    anycloud_price_per_hour_usd: float | None = typer.Option(
+        None,
+        "--anycloud-price-per-hour-usd",
+        min=0,
+        help="Hourly price of the trainer's GPU, used for cost estimates and the cap.",
+    ),
+    anycloud_maximum_step_seconds: float = typer.Option(
+        _DEFAULT_ANYCLOUD_MAXIMUM_STEP_SECONDS,
+        "--anycloud-maximum-step-seconds",
+        min=1,
+        help="Wall-clock ceiling for one AnyCloud optimizer step. A slower step stops the run.",
+    ),
 ) -> None:
     """Build routed interactions into W12 and run bounded W13 SFT automatically.
 
@@ -134,6 +189,14 @@ def optimize_model(
         training_usd_per_million_tokens: Explicit model-specific training price. Zero is accepted
             only when supplied by the user or entered during interactive setup.
         non_interactive: Require complete flags and refuse every prompt.
+        trainer: First-run trainer selection. Later runs use the frozen connection's provider.
+        anycloud_connection: AnyCloud trainer connection name used for first-run setup.
+        anycloud_url: Trainer service URL stored in a new AnyCloud connection.
+        anycloud_token_env: Environment-variable name holding the trainer bearer token.
+        anycloud_artifact_prefix: S3 prefix for AnyCloud trainer artifacts, required every run.
+        anycloud_artifact_region: Region of the AnyCloud artifact bucket, required every run.
+        anycloud_price_per_hour_usd: Hourly GPU price for AnyCloud cost bounds, required every run.
+        anycloud_maximum_step_seconds: Wall-clock ceiling for one AnyCloud optimizer step.
 
     Raises:
         typer.BadParameter: Local configuration, preflight, W13, or registration is unsafe.
@@ -144,11 +207,24 @@ def optimize_model(
         code_revision = installed_release_revision()
         store = ProjectStore(root, project)
         require_completed_runtime_interactions(store)
+        if trainer is Trainer.ANYCLOUD:
+            resolve_anycloud_run(
+                Trainer.ANYCLOUD,
+                trainer=trainer,
+                artifact_prefix=anycloud_artifact_prefix,
+                artifact_region=anycloud_artifact_region,
+                price_per_hour_usd=anycloud_price_per_hour_usd,
+                maximum_step_seconds=anycloud_maximum_step_seconds,
+            )
         initial_settings = _initial_settings(
             store,
             project=project,
+            trainer=trainer,
             tinker_connection=tinker_connection,
             tinker_api_key_env=tinker_api_key_env,
+            anycloud_connection=anycloud_connection,
+            anycloud_url=anycloud_url,
+            anycloud_token_env=anycloud_token_env,
             base_model_alias=base_model_alias,
             base_model=base_model,
             maximum_cost_usd=maximum_cost_usd,
@@ -163,10 +239,18 @@ def optimize_model(
         )
         config = preparation.config
         config_id = config.config_id
+        anycloud_run = resolve_anycloud_run(
+            connection_provider(store, config.tinker_connection),
+            trainer=trainer,
+            artifact_prefix=anycloud_artifact_prefix,
+            artifact_region=anycloud_artifact_region,
+            price_per_hour_usd=anycloud_price_per_hour_usd,
+            maximum_step_seconds=anycloud_maximum_step_seconds,
+        )
         local_preflight = preflight_sft_model_optimization(
             store,
             config_id,
-            _LocalPreflightBackend(),
+            _LocalPreflightBackend(anycloud_run),
             code_revision=code_revision,
         )
         if local_preflight.completed_result is None and not preparation.accepted:
@@ -180,16 +264,17 @@ def optimize_model(
             local_preflight = preflight_sft_model_optimization(
                 store,
                 config_id,
-                _LocalPreflightBackend(),
+                _LocalPreflightBackend(anycloud_run),
                 code_revision=code_revision,
             )
-        backend: TrainerBackend = _LocalPreflightBackend()
+        backend: TrainerBackend = _LocalPreflightBackend(anycloud_run)
         preflight = local_preflight
 
     if preflight.completed_result is None:
         assert preflight.conservative_schedule_cost_usd is not None
-        assert config.training.maximum_datum_tokens is not None
-        assert config.training.training_usd_per_million_tokens is not None
+        if anycloud_run is None:
+            assert config.training.maximum_datum_tokens is not None
+            assert config.training.training_usd_per_million_tokens is not None
         estimate = preflight.conservative_schedule_cost_usd.value
     else:
         estimate = 0.0
@@ -202,7 +287,8 @@ def optimize_model(
         non_interactive=non_interactive,
         previously_confirmed=preparation.accepted and preflight.completed_result is None,
     ):
-        _console.print("Managed Tinker SFT was not started.")
+        trainer_label = "AnyCloud" if anycloud_run is not None else "Tinker"
+        _console.print(f"Managed {trainer_label} SFT was not started.")
         return
     if preflight.completed_result is None and not preparation.accepted:
         with usage_error(AutomaticSFTPreparationError):
@@ -214,10 +300,19 @@ def optimize_model(
             )
     if preflight.completed_result is None:
         with usage_error(*_USAGE_ERRORS):
-            backend = _compose_tinker_backend(
-                store,
-                config.tinker_connection,
-                config.connection_config_sha256,
+            backend = (
+                _compose_tinker_backend(
+                    store,
+                    config.tinker_connection,
+                    config.connection_config_sha256,
+                )
+                if anycloud_run is None
+                else compose_anycloud_backend(
+                    store,
+                    config.tinker_connection,
+                    config.connection_config_sha256,
+                    anycloud_run,
+                )
             )
             preflight = preflight_sft_model_optimization(
                 store,
@@ -256,27 +351,41 @@ def optimize_model(
             "Verified completed W13 SFT; model alias "
             f"{config.model_alias!r} was already registered."
         )
+    if anycloud_run is not None:
+        _console.print(
+            f"The trained PEFT adapter is stored at {completed.model.sampling_handle}. "
+            "Experiential cannot serve anycloud aliases yet; load the adapter with a "
+            "PEFT-compatible server to use it."
+        )
 
 
 def _initial_settings(
     store: ProjectStore,
     *,
     project: str,
+    trainer: Trainer | None,
     tinker_connection: str | None,
     tinker_api_key_env: str | None,
+    anycloud_connection: str | None,
+    anycloud_url: str | None,
+    anycloud_token_env: str | None,
     base_model_alias: str | None,
     base_model: str | None,
     maximum_cost_usd: float | None,
     training_usd_per_million_tokens: float | None,
     non_interactive: bool,
 ) -> InitialSFTModelOptimizationSettings | None:
-    """Collect and persist only missing first-run Tinker catalog selections.
+    """Collect and persist only missing first-run trainer catalog selections.
 
     Args:
         store: Project whose catalog and selection state are inspected.
         project: Project ID used for the deterministic trained-model alias prefix.
+        trainer: Optional first-run trainer. ``None`` selects Tinker.
         tinker_connection: Optional explicit connection name from the CLI.
         tinker_api_key_env: Optional environment-variable name for the Tinker credential.
+        anycloud_connection: Optional AnyCloud trainer connection name.
+        anycloud_url: Optional trainer service URL for a new AnyCloud connection.
+        anycloud_token_env: Optional environment-variable name for the trainer token.
         base_model_alias: Optional explicit local base-model alias from the CLI.
         base_model: Optional exact Tinker model ID for a new alias.
         maximum_cost_usd: Optional finite immutable training cap shown before cost authorization.
@@ -304,6 +413,31 @@ def _initial_settings(
         return None
     catalog = load_model_catalog(store.model_catalog_path)
     catalog_sha256 = sha256_json(catalog)
+    if trainer is Trainer.ANYCLOUD:
+        return _initial_anycloud_settings(
+            store,
+            project=project,
+            catalog=catalog,
+            catalog_sha256=catalog_sha256,
+            connection_name=anycloud_connection,
+            url=anycloud_url,
+            token_env=anycloud_token_env,
+            base_model_alias=base_model_alias,
+            base_model=base_model,
+            maximum_cost_usd=maximum_cost_usd,
+            training_usd_per_million_tokens=training_usd_per_million_tokens,
+        )
+    anycloud_flags = [
+        name
+        for name, value in (
+            ("--anycloud-connection", anycloud_connection),
+            ("--anycloud-url", anycloud_url),
+            ("--anycloud-token-env", anycloud_token_env),
+        )
+        if value is not None
+    ]
+    if anycloud_flags:
+        raise typer.BadParameter(", ".join(anycloud_flags) + " require --trainer anycloud")
     interactive = not non_interactive and can_prompt(_console)
     connection_name = tinker_connection
     alias = base_model_alias
@@ -423,6 +557,137 @@ def _initial_settings(
     )
 
 
+def _initial_anycloud_settings(
+    store: ProjectStore,
+    *,
+    project: str,
+    catalog: ModelCatalog,
+    catalog_sha256: Sha256,
+    connection_name: str | None,
+    url: str | None,
+    token_env: str | None,
+    base_model_alias: str | None,
+    base_model: str | None,
+    maximum_cost_usd: float | None,
+    training_usd_per_million_tokens: float | None,
+) -> InitialSFTModelOptimizationSettings:
+    """Persist first-run AnyCloud trainer selections from explicit flags.
+
+    AnyCloud setup never prompts: the trainer URL, token variable, and base model come from flags
+    or from an existing ``anycloud`` connection and alias.
+
+    Args:
+        store: Project whose shared model catalog receives the selection.
+        project: Project ID used for the deterministic trained-model alias prefix.
+        catalog: Catalog validated before this call.
+        catalog_sha256: Digest of ``catalog`` used to detect concurrent writers.
+        connection_name: AnyCloud trainer connection name.
+        url: HTTPS trainer service URL for a new connection.
+        token_env: Environment-variable name holding the trainer token.
+        base_model_alias: Local alias for the exact Hugging Face base model.
+        base_model: Exact Hugging Face model ID when the alias is new.
+        maximum_cost_usd: Optional immutable training cap.
+        training_usd_per_million_tokens: Must be ``None``: AnyCloud prices by GPU-hour.
+
+    Returns:
+        Confirmed first-run settings bound to the AnyCloud connection.
+
+    Raises:
+        typer.BadParameter: A required flag is missing or conflicts with existing catalog entries.
+    """
+    if training_usd_per_million_tokens is not None:
+        raise typer.BadParameter(
+            "AnyCloud training is priced per GPU-hour; use --anycloud-price-per-hour-usd instead "
+            "of --training-usd-per-million-tokens"
+        )
+    connection = catalog.connections.get(connection_name) if connection_name is not None else None
+    if connection is not None:
+        if connection.provider != Trainer.ANYCLOUD:
+            raise typer.BadParameter(
+                f"connection {connection_name!r} uses provider {connection.provider!r}, "
+                "not 'anycloud'"
+            )
+        if url is not None and url != connection.base_url:
+            raise typer.BadParameter(
+                f"AnyCloud connection {connection_name!r} already names a different URL"
+            )
+        if token_env is not None and token_env != connection.api_key_env:
+            raise typer.BadParameter(
+                f"AnyCloud connection {connection_name!r} already names a different token variable"
+            )
+        url = connection.base_url
+        token_env = connection.api_key_env
+    missing = [
+        name
+        for name, value in (
+            ("--anycloud-connection", connection_name),
+            ("--anycloud-url", url),
+            ("--anycloud-token-env", token_env),
+            ("--base-model-alias", base_model_alias),
+        )
+        if value is None
+    ]
+    if missing:
+        raise typer.BadParameter(
+            "first `exp optimize model --trainer anycloud` requires "
+            + ", ".join(missing)
+            + "; add --base-model when the alias is new"
+        )
+    assert connection_name is not None
+    assert url is not None
+    assert token_env is not None
+    assert base_model_alias is not None
+    if urlsplit(url).scheme != "https":
+        raise typer.BadParameter("--anycloud-url must be an https URL")
+    record = catalog.models.get(base_model_alias)
+    if record is not None:
+        if record.connection != connection_name:
+            raise typer.BadParameter(
+                f"base model alias {base_model_alias!r} uses connection {record.connection!r}, "
+                f"not {connection_name!r}"
+            )
+        if base_model is not None and record.model != base_model:
+            raise typer.BadParameter(
+                f"base model alias {base_model_alias!r} already names a different exact model ID"
+            )
+        resolved_model = record.model
+    elif base_model is None:
+        raise typer.BadParameter(
+            f"base model alias {base_model_alias!r} is not configured; add --base-model with its "
+            "exact Hugging Face model ID"
+        )
+    else:
+        resolved_model = base_model
+    training = TinkerSFTSpec(
+        base_model=resolved_model,
+        lora_rank=_DEFAULT_LORA_RANK,
+        learning_rate=_DEFAULT_LEARNING_RATE,
+        batch_size=_DEFAULT_BATCH_SIZE,
+        epochs=_DEFAULT_EPOCHS,
+        checkpoint_every_steps=_DEFAULT_CHECKPOINT_EVERY_STEPS,
+        maximum_datum_tokens=_DEFAULT_MAXIMUM_DATUM_TOKENS,
+        maximum_cost_usd=(
+            _DEFAULT_MAXIMUM_COST_USD if maximum_cost_usd is None else maximum_cost_usd
+        ),
+    )
+    _persist_trainer_selection(
+        store,
+        observed_catalog_sha256=catalog_sha256,
+        desired_connection=ConnectionConfig(
+            provider=Trainer.ANYCLOUD, base_url=url, api_key_env=token_env
+        ),
+        connection_name=connection_name,
+        alias=base_model_alias,
+        resolved_model=resolved_model,
+    )
+    return InitialSFTModelOptimizationSettings(
+        model_alias_prefix=f"{project}-sft",
+        tinker_connection=connection_name,
+        base_model_alias=base_model_alias,
+        training=training,
+    )
+
+
 def _require_replay_settings_match(
     training: TinkerSFTSpec,
     *,
@@ -462,10 +727,7 @@ def _persist_tinker_selection(
     alias: str,
     resolved_model: str,
 ) -> None:
-    """Merge confirmed Tinker entries under a cross-process catalog lock.
-
-    Unrelated concurrent catalog additions are retained. Drift in either confirmed target fails
-    closed, while another process persisting the exact same selection is idempotent.
+    """Merge a confirmed native Tinker connection and base-model alias into the catalog.
 
     Args:
         store: Project whose shared model catalog receives the confirmed selection.
@@ -474,11 +736,42 @@ def _persist_tinker_selection(
         api_key_env: Confirmed credential environment-variable name. No secret value is read.
         alias: Confirmed local base-model alias.
         resolved_model: Confirmed exact Tinker base-model ID.
+    """
+    _persist_trainer_selection(
+        store,
+        observed_catalog_sha256=observed_catalog_sha256,
+        desired_connection=ConnectionConfig(provider="tinker", api_key_env=api_key_env),
+        connection_name=connection_name,
+        alias=alias,
+        resolved_model=resolved_model,
+    )
+
+
+def _persist_trainer_selection(
+    store: ProjectStore,
+    *,
+    observed_catalog_sha256: Sha256,
+    desired_connection: ConnectionConfig,
+    connection_name: str,
+    alias: str,
+    resolved_model: str,
+) -> None:
+    """Merge confirmed trainer entries under a cross-process catalog lock.
+
+    Unrelated concurrent catalog additions are retained. Drift in either confirmed target fails
+    closed, while another process persisting the exact same selection is idempotent.
+
+    Args:
+        store: Project whose shared model catalog receives the confirmed selection.
+        observed_catalog_sha256: Digest of the catalog shown and validated before confirmation.
+        desired_connection: Confirmed trainer connection metadata. No secret value is read.
+        connection_name: Confirmed trainer connection name.
+        alias: Confirmed local base-model alias.
+        resolved_model: Confirmed exact base-model ID.
 
     Raises:
         typer.BadParameter: A concurrent writer changed a confirmed connection or alias.
     """
-    desired_connection = ConnectionConfig(provider="tinker", api_key_env=api_key_env)
     desired_record = ModelRecord(
         connection=connection_name,
         model=resolved_model,
@@ -489,14 +782,15 @@ def _persist_tinker_selection(
         drifted = sha256_json(current) != observed_catalog_sha256
         existing_connection = current.connections.get(connection_name)
         connection_conflicts = existing_connection is not None and (
-            existing_connection.provider != "tinker"
+            existing_connection.provider != desired_connection.provider
             or existing_connection.base_url != desired_connection.base_url
-            or existing_connection.api_key_env not in {None, api_key_env}
+            or existing_connection.api_key_env not in {None, desired_connection.api_key_env}
         )
         if connection_conflicts:
             qualifier = "concurrently " if drifted else ""
             raise typer.BadParameter(
-                f"Tinker connection {connection_name!r} {qualifier}changed before setup commit"
+                f"{desired_connection.provider} connection {connection_name!r} "
+                f"{qualifier}changed before setup commit"
             )
         existing_record = current.models.get(alias)
         record_conflicts = existing_record is not None and (
@@ -531,6 +825,10 @@ def _persist_tinker_selection(
 class _LocalPreflightBackend:
     """Backend seam that permits local graph validation but cannot open a trainer."""
 
+    def __init__(self, anycloud_run: AnyCloudRun | None = None) -> None:
+        """Select the AnyCloud time-based bound, or the caller-priced token bound when unset."""
+        self.anycloud_run = anycloud_run
+
     def conservative_step_cost(
         self, spec: TinkerSFTSpec, *, batch_example_count: int
     ) -> NumericMeasurement | None:
@@ -543,6 +841,10 @@ class _LocalPreflightBackend:
         Returns:
             The conservative local estimate, or ``None`` when price inputs are incomplete.
         """
+        if self.anycloud_run is not None:
+            if batch_example_count <= 0:
+                raise ValueError("batch_example_count must be positive")
+            return self.anycloud_run.step_cost_bound()
         return conservative_training_step_cost(spec, batch_example_count=batch_example_count)
 
     def open(self, spec: TinkerSFTSpec, resume_state_path: str | None) -> Never:
@@ -581,23 +883,9 @@ def _compose_tinker_backend(
         ModelCredentialError: The selected credential environment variable is absent.
         SFTModelOptimizationPreflightError: The selected connection or optional SDK is invalid.
     """
-    catalog = load_model_catalog(store.model_catalog_path)
-    connection = catalog.connections.get(connection_name)
-    if connection is None or connection.provider != "tinker":
-        raise SFTModelOptimizationPreflightError(
-            f"selected connection {connection_name!r} is not a configured native Tinker connection"
-        )
-    current_connection_config_sha256 = sha256_json(
-        {
-            "provider": connection.provider,
-            "base_url": connection.base_url,
-            "api_key_env": connection.api_key_env,
-        }
+    connection = frozen_connection(
+        store, connection_name, expected_connection_config_sha256, provider="tinker"
     )
-    if current_connection_config_sha256 != expected_connection_config_sha256:
-        raise SFTModelOptimizationPreflightError(
-            "selected Tinker connection metadata drifted before credential resolution"
-        )
     api_key = read_connection_api_key(connection, connection_id=connection_name)
     try:
         import tinker

@@ -463,6 +463,14 @@ def test_first_run_setup_cancellation_writes_no_catalog_or_training_state(
             maximum_cost_usd=25.0,
             training_usd_per_million_tokens=100.0,
             non_interactive=False,
+            trainer=None,
+            anycloud_connection=None,
+            anycloud_url=None,
+            anycloud_token_env=None,
+            anycloud_artifact_prefix=None,
+            anycloud_artifact_region=None,
+            anycloud_price_per_hour_usd=None,
+            anycloud_maximum_step_seconds=600.0,
         )
 
     assert fixture.store.model_catalog_path.read_bytes() == catalog_bytes
@@ -1588,3 +1596,216 @@ def test_catalog_setup_preserves_compatible_base_model_metadata(tmp_path: Path) 
 
     assert fixture.store.model_catalog_path.read_bytes() == catalog_bytes
     assert load_model_catalog(fixture.store.model_catalog_path).models["base"] == existing_record
+
+
+def _anycloud_first_run_fixture(tmp_path: Path) -> ProjectStore:
+    """Persist one routed interaction and an unrelated catalog before AnyCloud setup.
+
+    Args:
+        tmp_path: Pytest-owned state directory.
+
+    Returns:
+        Project store ready for a first `--trainer anycloud` run.
+    """
+    fixture = _persisted_dataset(tmp_path)
+    write_model_catalog(
+        fixture.store.model_catalog_path,
+        ModelCatalog(connections={"openai": ConnectionConfig(provider="openai")}, models={}),
+    )
+    _complete(
+        RuntimeInteractionJournal(fixture.store.paths),
+        key="anycloud-runtime-source",
+        conversation="anycloud-runtime-conversation",
+        request=_request(ModelMessage(role="user", content="AnyCloud routed training request")),
+        output=AssistantAction(content="AnyCloud routed training response"),
+        now=_TIME,
+    )
+    return fixture.store
+
+
+_ANYCLOUD_SETUP_ARGS = [
+    "--trainer",
+    "anycloud",
+    "--anycloud-connection",
+    "anycloud-trainer",
+    "--anycloud-url",
+    "https://exp-trainer.anycloud.sh",
+    "--anycloud-token-env",
+    "TRAINER_TOKEN",
+    "--base-model-alias",
+    "qwen-base",
+    "--base-model",
+    "Qwen/Qwen3.5-4B",
+    "--maximum-cost-usd",
+    "5.0",
+]
+_ANYCLOUD_RUN_ARGS = [
+    "--anycloud-artifact-prefix",
+    "s3://trainer-bucket/projects/p1",
+    "--anycloud-artifact-region",
+    "us-west-2",
+    "--anycloud-price-per-hour-usd",
+    "1.29",
+]
+
+
+def _optimize_args(store: ProjectStore, *extra: str) -> list[str]:
+    return [
+        "optimize",
+        "model",
+        store.paths.project_id,
+        "--root",
+        str(store.paths.root),
+        *extra,
+    ]
+
+
+def test_cli_first_anycloud_run_persists_connection_and_trains_through_anycloud_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _anycloud_first_run_fixture(tmp_path)
+    command = importlib.import_module("exp.cli.optimize.model")
+    backend = _FakeBackend(conservative_cost_per_batch=0.10)
+    composed = []
+
+    def compose(store_arg, connection_name, connection_sha256, run):  # noqa: ANN001, ANN202
+        composed.append((connection_name, run))
+        return backend
+
+    def forbidden_tinker(*_args: object) -> Never:
+        raise AssertionError("an anycloud config must not compose the Tinker backend")
+
+    monkeypatch.setattr(command, "compose_anycloud_backend", compose)
+    monkeypatch.setattr(command, "_compose_tinker_backend", forbidden_tinker)
+    monkeypatch.setattr(command, "installed_release_revision", lambda: "anycloud-cli-test")
+
+    result = CliRunner().invoke(
+        app, _optimize_args(store, *_ANYCLOUD_SETUP_ARGS, *_ANYCLOUD_RUN_ARGS, "--yes")
+    )
+
+    assert result.exit_code == 0, result.output
+    assert backend.open_resume_paths == [None]
+    catalog = load_model_catalog(store.model_catalog_path)
+    assert catalog.connections["anycloud-trainer"] == ConnectionConfig(
+        provider="anycloud",
+        base_url="https://exp-trainer.anycloud.sh",
+        api_key_env="TRAINER_TOKEN",
+    )
+    assert catalog.models["qwen-base"].model == "Qwen/Qwen3.5-4B"
+    latest = load_latest_sft_model_optimization(store)
+    assert latest is not None
+    config = command.load_sft_model_optimization_config(store, latest.config.artifact_id)
+    assert config.tinker_connection == "anycloud-trainer"
+    assert config.training.training_usd_per_million_tokens is None
+    assert catalog.models[config.model_alias].connection == "anycloud-trainer"
+    ((connection_name, run),) = composed
+    assert connection_name == "anycloud-trainer"
+    assert run.artifact_prefix == "s3://trainer-bucket/projects/p1"
+    assert run.artifact_region == "us-west-2"
+    assert run.price_per_hour_usd == 1.29
+    assert run.maximum_step_seconds == 600.0
+    assert "cannotserveanycloudaliases" in _flat_cli_output(result.output)
+
+
+def test_cli_anycloud_consent_estimate_prices_steps_by_gpu_hour(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _anycloud_first_run_fixture(tmp_path)
+    command = importlib.import_module("exp.cli.optimize.model")
+    estimates = []
+
+    def decline(*_args, estimated_cost_usd, **_kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        estimates.append(estimated_cost_usd)
+        return False
+
+    def forbidden_backend(*_args: object) -> Never:
+        raise AssertionError("declined consent must not compose a backend")
+
+    monkeypatch.setattr(command, "require_spend_consent", decline)
+    monkeypatch.setattr(command, "compose_anycloud_backend", forbidden_backend)
+    monkeypatch.setattr(command, "installed_release_revision", lambda: "anycloud-cli-test")
+
+    result = CliRunner().invoke(
+        app,
+        _optimize_args(
+            store,
+            *_ANYCLOUD_SETUP_ARGS,
+            *_ANYCLOUD_RUN_ARGS,
+            "--anycloud-maximum-step-seconds",
+            "120",
+        ),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Managed AnyCloud SFT was not started." in result.output
+    (estimate,) = estimates
+    step_bound = 1.29 * 120 / 3600
+    steps = estimate / step_bound
+    assert steps >= 1
+    assert steps == pytest.approx(round(steps))
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (["--anycloud-url", "https://exp-trainer.anycloud.sh"], "require --trainer anycloud"),
+        (
+            [*_ANYCLOUD_SETUP_ARGS, "--anycloud-artifact-prefix", "s3://trainer-bucket/p"],
+            "requires --anycloud-artifact-region, --anycloud-price-per-hour-usd",
+        ),
+        (
+            [*_ANYCLOUD_SETUP_ARGS, *_ANYCLOUD_RUN_ARGS, "--training-usd-per-million-tokens", "1"],
+            "priced per GPU-hour",
+        ),
+        (
+            [
+                *_ANYCLOUD_SETUP_ARGS[:5],
+                "http://exp-trainer.anycloud.sh",
+                *_ANYCLOUD_SETUP_ARGS[6:],
+                *_ANYCLOUD_RUN_ARGS,
+            ],
+            "must be an https URL",
+        ),
+    ],
+)
+def test_cli_rejects_incomplete_or_mismatched_anycloud_setup_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: list[str], message: str
+) -> None:
+    store = _anycloud_first_run_fixture(tmp_path)
+    command = importlib.import_module("exp.cli.optimize.model")
+    catalog_bytes = store.model_catalog_path.read_bytes()
+    monkeypatch.setattr(command, "installed_release_revision", lambda: "anycloud-cli-test")
+
+    result = CliRunner().invoke(app, _optimize_args(store, *extra, "--non-interactive"))
+
+    assert result.exit_code != 0
+    assert message.replace(" ", "") in _flat_cli_output(result.output)
+    assert store.model_catalog_path.read_bytes() == catalog_bytes
+    assert load_latest_sft_model_optimization(store) is None
+
+
+def test_cli_rejects_anycloud_flags_for_a_frozen_tinker_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured = _configured_project(tmp_path, _spec(maximum_cost_usd=1.0))
+    command = importlib.import_module("exp.cli.optimize.model")
+
+    def forbidden_backend(*_args: object) -> Never:
+        raise AssertionError("a rejected invocation must not compose a backend")
+
+    monkeypatch.setattr(command, "_compose_tinker_backend", forbidden_backend)
+    monkeypatch.setattr(command, "compose_anycloud_backend", forbidden_backend)
+    monkeypatch.setattr(command, "installed_release_revision", lambda: "w14m-test")
+    runner = CliRunner()
+
+    trainer_mismatch = runner.invoke(
+        app, _optimize_args(configured.store, "--trainer", "anycloud", *_ANYCLOUD_RUN_ARGS)
+    )
+    storage_on_tinker = runner.invoke(app, _optimize_args(configured.store, *_ANYCLOUD_RUN_ARGS))
+
+    assert trainer_mismatch.exit_code != 0
+    assert "differsfromtheselectedconfig's'tinker'connection" in _flat_cli_output(
+        trainer_mismatch.output
+    )
+    assert storage_on_tinker.exit_code != 0
+    assert "applyonlytoananycloudtrainer" in _flat_cli_output(storage_on_tinker.output)

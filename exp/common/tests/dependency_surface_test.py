@@ -30,6 +30,8 @@ def test_forbidden_provider_imports_are_absent() -> None:
             "exp.common.vendor",
         },
         allowed={
+            ("runtime/models/providers/anycloud_s3.py", "boto3"),
+            ("runtime/models/providers/anycloud_s3.py", "botocore.config"),
             ("runtime/models/providers/bedrock.py", "boto3"),
             ("runtime/models/providers/bedrock.py", "botocore.auth"),
             ("runtime/models/providers/bedrock.py", "botocore.awsrequest"),

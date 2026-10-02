@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import re
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol, TypeVar
@@ -38,12 +39,26 @@ class AnyCloudArtifactUpload(ContractModel):
     upload_url: SecretStr
 
 
+class AnyCloudArtifactTarget(Protocol):
+    """One opaque resource identity and the short-lived URL that uploads it."""
+
+    @property
+    def resource_id(self) -> str:
+        """Return the non-secret identity retained in Experiential's SFT evidence."""
+        ...
+
+    @property
+    def upload_url(self) -> SecretStr:
+        """Return the signed upload URL, used once and never persisted."""
+        ...
+
+
 class AnyCloudTrainerArtifactStore(Protocol):
     """Caller-owned authorization for immutable trainer artifact transfers."""
 
     def begin_upload(
         self, *, kind: Literal["state", "sampling"], name: str
-    ) -> AnyCloudArtifactUpload:
+    ) -> AnyCloudArtifactTarget:
         """Return an opaque resource identity and short-lived upload URL."""
         ...
 
@@ -109,6 +124,31 @@ class _SaveArtifactResponse(ContractModel):
 _ResponseT = TypeVar("_ResponseT", bound=ContractModel)
 
 
+def anycloud_step_cost_bound(
+    *, price_per_hour_usd: float, maximum_step_seconds: float
+) -> NumericMeasurement:
+    """Bound one remote optimizer step from the hourly compute price and its time ceiling.
+
+    Args:
+        price_per_hour_usd: Confirmed hourly price for the selected AnyCloud compute.
+        maximum_step_seconds: Conservative wall-clock ceiling for one optimizer step.
+
+    Returns:
+        The estimated upper cost of one step.
+
+    Raises:
+        ValueError: The price is negative or nonfinite, or the ceiling is not positive.
+    """
+    if not math.isfinite(price_per_hour_usd) or price_per_hour_usd < 0:
+        raise ValueError("price_per_hour_usd must be finite and nonnegative")
+    if not math.isfinite(maximum_step_seconds) or maximum_step_seconds <= 0:
+        raise ValueError("maximum_step_seconds must be finite and positive")
+    return NumericMeasurement(
+        value=price_per_hour_usd * maximum_step_seconds / 3600,
+        provenance="estimated",
+    )
+
+
 class AnyCloudTrainerBackend:
     """Open stateful remote LoRA sessions through an injected AnyCloud service client."""
 
@@ -133,10 +173,9 @@ class AnyCloudTrainerBackend:
         Raises:
             ValueError: Either cost input is negative, nonfinite, or the step bound is zero.
         """
-        if not math.isfinite(price_per_hour_usd) or price_per_hour_usd < 0:
-            raise ValueError("price_per_hour_usd must be finite and nonnegative")
-        if not math.isfinite(maximum_step_seconds) or maximum_step_seconds <= 0:
-            raise ValueError("maximum_step_seconds must be finite and positive")
+        anycloud_step_cost_bound(
+            price_per_hour_usd=price_per_hour_usd, maximum_step_seconds=maximum_step_seconds
+        )
         if model_revision is not None and re.fullmatch(r"[0-9a-f]{40}", model_revision) is None:
             raise ValueError("model_revision must be an exact lowercase 40-hex revision")
         self._client = client
@@ -163,9 +202,9 @@ class AnyCloudTrainerBackend:
         del spec
         if batch_example_count <= 0:
             raise ValueError("batch_example_count must be positive")
-        return NumericMeasurement(
-            value=self._price_per_hour_usd * self._maximum_step_seconds / 3600,
-            provenance="estimated",
+        return anycloud_step_cost_bound(
+            price_per_hour_usd=self._price_per_hour_usd,
+            maximum_step_seconds=self._maximum_step_seconds,
         )
 
     def open(self, spec: TinkerSFTSpec, resume_state_path: str | None) -> TrainerSession:
@@ -203,6 +242,7 @@ class AnyCloudTrainerBackend:
             client=self._client,
             artifact_store=self._artifact_store,
             session_id=response.session_id,
+            price_per_hour_usd=self._price_per_hour_usd,
         )
 
     def _post(
@@ -241,11 +281,13 @@ class AnyCloudTrainerSession:
         client: httpx.Client,
         artifact_store: AnyCloudTrainerArtifactStore,
         session_id: str,
+        price_per_hour_usd: float,
     ) -> None:
-        """Bind a caller-owned client, artifact store, and exact remote session identity."""
+        """Bind a caller-owned client, artifact store, hourly price, and remote session identity."""
         self._client = client
         self._artifact_store = artifact_store
         self._session_id = session_id
+        self._price_per_hour_usd = price_per_hour_usd
 
     def render_examples(self, examples: Sequence[SFTExample]) -> tuple[TrainerDatum, ...]:
         """Render complete Experiential conversations on the selected remote base model.
@@ -300,7 +342,8 @@ class AnyCloudTrainerSession:
             learning_rate: Frozen Adam learning rate for the scheduled step.
 
         Returns:
-            Backend-reported finite loss and gradient norm.
+            Backend-reported finite loss and gradient norm, plus the step's estimated cost: its
+            measured wall-clock duration at the confirmed hourly compute price.
 
         Raises:
             TinkerSFTError: A datum belongs to another backend or session, or dispatch fails.
@@ -316,15 +359,21 @@ class AnyCloudTrainerSession:
             if datum.session_id != self._session_id:
                 raise TinkerSFTError("AnyCloud trainer received a datum from another session")
             datum_ids.append(datum.datum_id)
+        started = time.monotonic()
         response = self._post(
             "batches:train",
             {"datum_ids": datum_ids, "learning_rate": learning_rate},
             _TrainBatchResponse,
             operation="train batch",
         )
+        elapsed_seconds = max(time.monotonic() - started, 0.0)
         return TrainerBatchResult(
             loss=response.loss,
             gradient_norm=response.gradient_norm,
+            cost_usd=NumericMeasurement(
+                value=self._price_per_hour_usd * elapsed_seconds / 3600,
+                provenance="estimated",
+            ),
         )
 
     def save_state(self, checkpoint_name: str) -> str:

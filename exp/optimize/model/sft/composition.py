@@ -702,8 +702,12 @@ def _config_id(
     )
 
 
+SFT_TRAINER_PROVIDERS = frozenset({"anycloud", "tinker"})
+"""Connection providers whose trainer adapters satisfy the W13 ``TrainerBackend`` seam."""
+
+
 def _load_tinker_catalog(store: ProjectStore, connection_name: ArtifactId) -> ModelCatalog:
-    """Load a local catalog and require its configured connection to be native Tinker."""
+    """Load a local catalog and require its configured connection to name an SFT trainer."""
     try:
         catalog = load_model_catalog(store.model_catalog_path)
     except ModelCatalogError as exc:
@@ -715,9 +719,9 @@ def _load_tinker_catalog(store: ProjectStore, connection_name: ArtifactId) -> Mo
         raise SFTModelOptimizationPreflightError(
             f"SFT model optimization config names unknown connection {connection_name!r}"
         )
-    if connection.provider != "tinker":
+    if connection.provider not in SFT_TRAINER_PROVIDERS:
         raise SFTModelOptimizationPreflightError(
-            "SFT model optimization config requires a tinker connection, not "
+            "SFT model optimization config requires a tinker or anycloud connection, not "
             f"{connection.provider!r}"
         )
     return catalog

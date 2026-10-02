@@ -6,6 +6,7 @@ from exp.optimize.model.sft.anycloud import (
     AnyCloudTrainerArtifactStore,
     AnyCloudTrainerBackend,
     AnyCloudTrainerSession,
+    anycloud_step_cost_bound,
 )
 from exp.optimize.model.sft.automatic import (
     AutomaticSFTPreparation,
@@ -25,6 +26,7 @@ from exp.optimize.model.sft.builder import (
     write_sft_dataset,
 )
 from exp.optimize.model.sft.composition import (
+    SFT_TRAINER_PROVIDERS,
     SFTModelOptimizationConfig,
     SFTModelOptimizationError,
     SFTModelOptimizationPreflight,
@@ -93,6 +95,7 @@ __all__ = [
     "AnyCloudTrainerArtifactStore",
     "AnyCloudTrainerBackend",
     "AnyCloudTrainerSession",
+    "anycloud_step_cost_bound",
     "AutomaticSFTPreparation",
     "AutomaticSFTPreparationError",
     "InitialSFTModelOptimizationSettings",
@@ -111,6 +114,7 @@ __all__ = [
     "SFTModelOptimizationError",
     "SFTModelOptimizationPreflight",
     "SFTModelOptimizationPreflightError",
+    "SFT_TRAINER_PROVIDERS",
     "SFTModelOptimizationResult",
     "SFTBuildSpec",
     "SFTDataset",

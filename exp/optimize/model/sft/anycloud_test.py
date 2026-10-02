@@ -11,6 +11,7 @@ from pydantic import SecretStr
 
 from exp.common.core.artifacts import ArtifactInput
 from exp.common.models import AssistantAction
+from exp.optimize.model.sft import anycloud
 from exp.optimize.model.sft.anycloud import (
     AnyCloudArtifactUpload,
     AnyCloudSFTDatum,
@@ -90,7 +91,7 @@ class _TrainerService:
         self.requests: list[tuple[str, dict[str, object]]] = []
 
     def handle(self, request: httpx.Request) -> httpx.Response:
-        """Respond to the complete AnyCloud trainer surface used by WMO."""
+        """Respond to the complete AnyCloud trainer surface used by Experiential."""
         payload = json.loads(request.content)
         self.requests.append((request.url.path, payload))
         if request.url.path == "/v1/sessions":
@@ -212,6 +213,25 @@ def test_adapter_cost_bound_uses_confirmed_vm_price_and_step_ceiling() -> None:
             maximum_step_seconds=120,
             model_revision="main",
         )
+
+
+def test_adapter_reports_measured_step_time_at_the_hourly_price(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each step reports an estimated cost so a capped W13 run can continue past step one."""
+    service = _TrainerService()
+    store = _ArtifactStore()
+    backend, client = _backend(service, store)
+    clock = iter((100.0, 130.0))
+    monkeypatch.setattr(anycloud.time, "monotonic", lambda: next(clock))
+    with client:
+        session = backend.open(_spec(), None)
+        (datum,) = session.render_examples((_example(),))
+        result = session.train_batch((datum,), learning_rate=0.0002)
+
+    assert result.cost_usd is not None
+    assert result.cost_usd.value == pytest.approx(1.09 * 30 / 3600)
+    assert result.cost_usd.provenance == "estimated"
 
 
 def test_adapter_rejects_foreign_session_datums_before_remote_dispatch() -> None:
